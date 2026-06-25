@@ -6,7 +6,6 @@ from typing import Literal, Tuple, TypedDict, Union, Dict, Any, Optional, List
 from PIL import Image
 from dataclasses import dataclass
 from tokenizers import Tokenizer
-from torch.nn.attention.flex_attention import create_block_mask
 
 from .config import MoondreamConfig
 from .image_crops import reconstruct_from_crops
@@ -50,8 +49,8 @@ ObjectSamplingSettings = TypedDict(
 
 DEFAULT_MAX_TOKENS = 768
 DEFAULT_TEMPERATURE = 0.5
-DEFAULT_TOP_P = 0.9
-DEFAULT_MAX_OBJECTS = 150
+DEFAULT_TOP_P = 0.3
+DEFAULT_MAX_OBJECTS = 50
 
 
 @dataclass(frozen=True)
@@ -79,17 +78,6 @@ class KVCache(nn.Module):
         return kout, vout
 
 
-def causal_mask(b, h, q_idx, kv_idx):
-    return q_idx >= kv_idx
-
-
-def get_mask_mod(mask_mod, offset):
-    def _mask_mod(b, h, q, kv):
-        return mask_mod(b, h, q + offset, kv)
-
-    return _mask_mod
-
-
 class MoondreamModel(nn.Module):
 
     def __init__(
@@ -111,14 +99,32 @@ class MoondreamModel(nn.Module):
                 "coord_encoder": linear_cls(
                     config.region.coord_feat_dim, config.region.dim, dtype=dtype
                 ),
-                "coord_decoder": linear_cls(
-                    config.region.dim, config.region.coord_out_dim, dtype=dtype
+                "coord_decoder": nn.ModuleDict(
+                    {
+                        "fc1": linear_cls(
+                            config.region.dim, config.region.inner_dim, dtype=dtype
+                        ),
+                        "fc2": linear_cls(
+                            config.region.inner_dim,
+                            config.region.coord_out_dim,
+                            dtype=dtype,
+                        ),
+                    }
                 ),
                 "size_encoder": linear_cls(
                     config.region.size_feat_dim, config.region.dim, dtype=dtype
                 ),
-                "size_decoder": linear_cls(
-                    config.region.dim, config.region.size_out_dim, dtype=dtype
+                "size_decoder": nn.ModuleDict(
+                    {
+                        "fc1": linear_cls(
+                            config.region.dim, config.region.inner_dim, dtype=dtype
+                        ),
+                        "fc2": linear_cls(
+                            config.region.inner_dim,
+                            config.region.size_out_dim,
+                            dtype=dtype,
+                        ),
+                    }
                 ),
             }
         )
@@ -139,35 +145,9 @@ class MoondreamModel(nn.Module):
         attn_mask[..., :prefix_attn_len, :prefix_attn_len] = 1
         self.register_buffer("attn_mask", attn_mask, persistent=False)
 
-        self.use_flex_decoding = True
-        self._causal_block_mask = None
-        self._point_gen_indices = None
-
         # Initialize KV caches.
         if setup_caches:
             self._setup_caches()
-
-    @property
-    def causal_block_mask(self):
-        # The things we do to deal with ZeroGPU...
-        if self._causal_block_mask is None:
-            self._causal_block_mask = create_block_mask(
-                causal_mask,
-                B=None,
-                H=None,
-                Q_LEN=self.config.text.max_context,
-                KV_LEN=self.config.text.max_context,
-            )
-        return self._causal_block_mask
-
-    @property
-    def point_gen_indices(self):
-        if self._point_gen_indices is None:
-            self._point_gen_indices = torch.tensor(
-                [self.config.tokenizer.coord_id, self.config.tokenizer.eos_id],
-                device=self.device,
-            )
-        return self._point_gen_indices
 
     def _setup_caches(self):
         c = self.config.text
@@ -206,27 +186,9 @@ class MoondreamModel(nn.Module):
         attn_mask: torch.Tensor,
         pos_ids: torch.Tensor,
         lora: Optional[torch.Tensor],
-        lm_head_indices: Optional[torch.Tensor] = None,
     ):
-        if self.use_flex_decoding:
-            torch._assert(pos_ids.shape[-1] == 1, "Invalid position ID shape")
-            block_index = pos_ids // self.causal_block_mask.BLOCK_SIZE[0]
-            mask = self.causal_block_mask[:, :, block_index]
-            mask.seq_lengths = (1, mask.seq_lengths[1])
-            mask.mask_mod = get_mask_mod(self.causal_block_mask.mask_mod, pos_ids[0])
-        else:
-            mask = None
-
-        hidden = text_decoder(
-            x,
-            self.text,
-            attn_mask,
-            pos_ids,
-            self.config.text,
-            lora=lora,
-            flex_block_mask_slice=mask,
-        )
-        logits = lm_head(hidden, self.text, indices=lm_head_indices)
+        hidden = text_decoder(x, self.text, attn_mask, pos_ids, self.config.text, lora)
+        logits = lm_head(hidden, self.text)
         return logits, hidden
 
     def compile(self):
@@ -234,40 +196,12 @@ class MoondreamModel(nn.Module):
             if isinstance(module, QuantizedLinear):
                 module.unpack()
 
-        # Initialize lazy properties to avoid first-call overhead
-        self.causal_block_mask
-        self.point_gen_indices
-
-        # TODO: vision_projection and _prefill is not being compiled
+        # TODO: vision_projection is not being compiled
         self._vis_enc = torch.compile(self._vis_enc, fullgraph=True)
+        self._prefill = torch.compile(self._prefill, fullgraph=True)
         self._decode_one_tok = torch.compile(
             self._decode_one_tok, fullgraph=True, mode="reduce-overhead"
         )
-
-        # Warm up compiled methods with dummy forward passes
-        device = self.device
-        dtype = self.vision.pos_emb.dtype
-        with torch.no_grad():
-            # Warmup vision encoder
-            dummy_crops = torch.randn(1, 3, 378, 378, device=device, dtype=dtype)
-            self._vis_enc(dummy_crops)
-
-            # Warmup _decode_one_tok (both normal and point generation modes)
-            dummy_emb = torch.randn(
-                1, 1, self.config.text.dim, device=device, dtype=dtype
-            )
-            dummy_mask = torch.ones(
-                1, 1, self.config.text.max_context, device=device, dtype=torch.bool
-            )
-            dummy_pos_ids = torch.tensor([100], device=device, dtype=torch.long)
-            self._decode_one_tok(dummy_emb, dummy_mask, dummy_pos_ids, None)
-            self._decode_one_tok(
-                dummy_emb,
-                dummy_mask,
-                dummy_pos_ids,
-                None,
-                lm_head_indices=self.point_gen_indices,
-            )
 
     def _run_vision_encoder(self, image: Image.Image) -> torch.Tensor:
         all_crops, tiling = prepare_crops(image, self.config.vision, device=self.device)
@@ -305,7 +239,7 @@ class MoondreamModel(nn.Module):
 
         lora = (
             variant_state_dict(settings["variant"], device=self.device)
-            if settings is not None and "variant" in settings
+            if settings is not None and settings["variant"] is not None
             else None
         )
 
@@ -319,9 +253,7 @@ class MoondreamModel(nn.Module):
             )
             inputs_embeds = torch.cat([bos_emb, img_emb[None]], dim=1)
             mask = self.attn_mask[:, :, 0 : inputs_embeds.size(1), :]
-            pos_ids = torch.arange(
-                inputs_embeds.size(1), dtype=torch.long, device=self.device
-            )
+            pos_ids = torch.arange(inputs_embeds.size(1), dtype=torch.long)
             self._prefill(inputs_embeds, mask, pos_ids, lora)
 
         return EncodedImage(
@@ -374,9 +306,7 @@ class MoondreamModel(nn.Module):
                 attn_mask = self.attn_mask
 
             mask = attn_mask[:, :, pos : pos + prompt_emb.size(1), :]
-            pos_ids = torch.arange(
-                pos, pos + prompt_emb.size(1), dtype=torch.long, device=self.device
-            )
+            pos_ids = torch.arange(pos, pos + prompt_emb.size(1), dtype=torch.long)
             hidden_BC = self._prefill(prompt_emb, mask, pos_ids, lora)
             logits_BV = lm_head(hidden_BC, self.text)
 
@@ -430,9 +360,7 @@ class MoondreamModel(nn.Module):
         text_token_chunks = [[]]
         grounding_chunks = [[]]
 
-        mask = torch.zeros(
-            1, 1, self.config.text.max_context, device=self.device, dtype=torch.bool
-        )
+        mask = torch.zeros(1, 1, 2048, device=self.device, dtype=torch.bool)
         mask[:, :, :pos] = 1
         pos_ids = torch.tensor([pos], device=self.device, dtype=torch.long)
         generated_tokens = 0
@@ -541,9 +469,7 @@ class MoondreamModel(nn.Module):
         )
 
         def generator(next_token, pos):
-            mask = torch.zeros(
-                1, 1, self.config.text.max_context, device=self.device, dtype=torch.bool
-            )
+            mask = torch.zeros(1, 1, 2048, device=self.device, dtype=torch.bool)
             mask[:, :, :pos] = 1
             pos_ids = torch.tensor([pos], device=self.device, dtype=torch.long)
             generated_tokens = 0
@@ -616,7 +542,7 @@ class MoondreamModel(nn.Module):
         self,
         image: Optional[Union[Image.Image, EncodedImage]] = None,
         question: str = None,
-        reasoning: bool = True,
+        reasoning: bool = False,
         spatial_refs: Optional[SpatialRefs] = None,
         stream: bool = False,
         settings: Optional[TextSamplingSettings] = None,
@@ -658,7 +584,10 @@ class MoondreamModel(nn.Module):
                     spatial_toks.extend([coord_id, coord_id, size_id])
 
         prompt_tokens = [
-            prompt_toks + spatial_toks + self.tokenizer.encode(question).ids
+            prompt_toks
+            + spatial_toks
+            + self.tokenizer.encode(question).ids
+            + self.config.tokenizer.templates["query"]["suffix"]
         ]
 
         if reasoning:
@@ -731,9 +660,7 @@ class MoondreamModel(nn.Module):
         lora: Optional[dict] = None,
     ):
         out = []
-        mask = torch.zeros(
-            1, 1, self.config.text.max_context, device=self.device, dtype=torch.bool
-        )
+        mask = torch.zeros(1, 1, 2048, device=self.device, dtype=torch.bool)
         mask[:, :, :pos] = 1
         pos_ids = torch.tensor([pos], device=self.device, dtype=torch.long)
 
@@ -799,17 +726,9 @@ class MoondreamModel(nn.Module):
 
                 # Decode next token (x-coordinate, or eos)
                 mask[:, :, pos], pos_ids[0] = 1, pos
-                logits, hidden = self._decode_one_tok(
-                    next_emb,
-                    mask,
-                    pos_ids,
-                    lora,
-                    lm_head_indices=self.point_gen_indices,
-                )
+                logits, hidden = self._decode_one_tok(next_emb, mask, pos_ids, lora)
                 pos += 1
-                # Map back: index 0 -> coord_id, index 1 -> eos_id
-                next_token_idx = torch.argmax(logits, dim=-1)
-                next_token = self.point_gen_indices[next_token_idx]
+                next_token = torch.argmax(logits, dim=-1)
 
         return out
 
@@ -943,10 +862,7 @@ class MoondreamModel(nn.Module):
 
             mask = self.attn_mask[:, :, image.pos : image.pos + prompt_emb.size(1), :]
             pos_ids = torch.arange(
-                image.pos,
-                image.pos + prompt_emb.size(1),
-                dtype=torch.long,
-                device=self.device,
+                image.pos, image.pos + prompt_emb.size(1), dtype=torch.long
             )
             hidden = self._prefill(prompt_emb, mask, pos_ids, lora=None)
             logits = lm_head(hidden, self.text)

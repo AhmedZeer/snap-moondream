@@ -3,25 +3,16 @@ from typing import Dict, List, Optional
 
 
 @dataclass(frozen=True)
-class TextMoeConfig:
-    num_experts: int = 64
-    start_layer: int = 4
-    experts_per_token: int = 8
-    expert_inner_dim: int = 1024
-
-
-@dataclass(frozen=True)
 class TextConfig:
     dim: int = 2048
     ff_dim: int = 8192
     n_layers: int = 24
     vocab_size: int = 51200
-    max_context: int = 4096
+    max_context: int = 2048
     n_heads: int = 32
     n_kv_heads: int = 32
     prefix_attn: int = 730
     group_size: Optional[int] = None
-    moe: Optional[TextMoeConfig] = TextMoeConfig()
 
 
 @dataclass(frozen=True)
@@ -46,6 +37,7 @@ class RegionConfig:
     coord_out_dim: int = 1024
     size_feat_dim: int = 512
     size_out_dim: int = 2048
+    inner_dim: int = 8192
     group_size: Optional[int] = None
 
 

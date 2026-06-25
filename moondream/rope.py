@@ -6,7 +6,8 @@ import torch
 def precompute_freqs_cis(
     dim: int,
     end: int,
-    theta: float = 1500000.0,
+    theta: float = 10000.0,
+    use_scaled: bool = False,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=dtype)[: (dim // 2)] / dim))
