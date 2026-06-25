@@ -132,8 +132,19 @@ def text_decoder(
     position_ids: torch.Tensor,
     config: TextConfig,
     lora: Optional[dict],
+    start_layer: int = 0,
+    end_layer: Optional[int] = None,
 ):
-    for i, block in enumerate(w.blocks):
+    """Run text decoder blocks[start_layer:end_layer].
+
+    When start_layer/end_layer are given, only a contiguous range of blocks
+    is executed. This supports mid-prefill token pruning: run layers 0..Li,
+    prune/compact, then run layers Li+1..Ln on the reduced sequence.
+    """
+    if end_layer is None:
+        end_layer = len(w.blocks)
+    for i in range(start_layer, end_layer):
+        block = w.blocks[i]
         if lora is not None:
             layer_lora = lora["text"]["blocks"][str(i)]
             mlp_lora = layer_lora["mlp"]

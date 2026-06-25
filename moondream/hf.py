@@ -20,6 +20,7 @@ import torch
 from transformers import AutoTokenizer
 
 from .hf_moondream import HfConfig, HfMoondream
+from .topv import PruningConfig
 from .weights import load_weights_into_model
 
 #: Hugging Face Hub revision (tag) this vendored code is pinned to.
@@ -57,12 +58,13 @@ class Moondream(HfMoondream):
         revision: Optional[str] = LATEST_REVISION,
         torch_dtype: Optional[torch.dtype] = None,
         device: Optional[Union[str, torch.device]] = None,
+        pruning_config: Optional[PruningConfig] = None,
         **kwargs,
     ) -> "Moondream":
         # Build the model with the default MoondreamConfig (the hub config.json
         # ships an empty `config` field, so HfConfig falls back to dataclass
         # defaults that match the 2025-06-21 checkpoint).
-        model = cls(HfConfig())
+        model = cls(HfConfig(), pruning_config=pruning_config)
         dtype = torch_dtype if torch_dtype is not None else model.model.vision.pos_emb.dtype
 
         # Download weights only (code comes from this editable package).

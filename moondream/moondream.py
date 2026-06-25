@@ -22,6 +22,8 @@ from .region import (
 from .layers import QuantizedLinear
 from .lora import variant_state_dict
 from .utils import remove_outlier_points
+from .topv import PruningConfig, prune_visual_tokens
+from .rope import apply_rotary_emb, precompute_freqs_cis, rerotate_rope
 
 ImageEncodingSettings = TypedDict(
     "ImageEncodingSettings",
@@ -81,10 +83,15 @@ class KVCache(nn.Module):
 class MoondreamModel(nn.Module):
 
     def __init__(
-        self, config: MoondreamConfig, dtype=torch.bfloat16, setup_caches=True
+        self,
+        config: MoondreamConfig,
+        dtype=torch.bfloat16,
+        setup_caches=True,
+        pruning_config: Optional[PruningConfig] = None,
     ):
         super().__init__()
         self.config = config
+        self.pruning_config = pruning_config or PruningConfig()
 
         self.tokenizer = Tokenizer.from_pretrained("moondream/starmie-v1")
         self.vision = build_vision_model(config.vision, dtype)
@@ -149,6 +156,20 @@ class MoondreamModel(nn.Module):
         if setup_caches:
             self._setup_caches()
 
+    def _rebuild_attn_mask(self, prefix_attn_len: int):
+        """Rebuild the attention mask with a new bidirectional prefix length.
+
+        Called after pruning compacts the visual token prefix.
+        """
+        c = self.config.text
+        attn_mask = torch.tril(
+            torch.ones(
+                1, 1, c.max_context, c.max_context, dtype=torch.bool
+            )
+        )
+        attn_mask[..., :prefix_attn_len, :prefix_attn_len] = 1
+        self.attn_mask = attn_mask.to(self.device)
+
     def _setup_caches(self):
         c = self.config.text
         for b in self.text.blocks:
@@ -177,8 +198,13 @@ class MoondreamModel(nn.Module):
         attn_mask: torch.Tensor,
         pos_ids: torch.Tensor,
         lora: Optional[torch.Tensor],
+        start_layer: int = 0,
+        end_layer: Optional[int] = None,
     ):
-        return text_decoder(x, self.text, attn_mask, pos_ids, self.config.text, lora)
+        return text_decoder(
+            x, self.text, attn_mask, pos_ids, self.config.text, lora,
+            start_layer=start_layer, end_layer=end_layer,
+        )
 
     def _decode_one_tok(
         self,
@@ -227,6 +253,57 @@ class MoondreamModel(nn.Module):
 
         return self._vis_proj(global_features, reconstructed)
 
+    def _compact_kv_caches(
+        self,
+        keep_indices: torch.Tensor,
+        n_visual: int,
+        lora: Optional[torch.Tensor],
+    ) -> int:
+        """Compact KV caches for layers 0..prune_layer after visual token pruning.
+
+        Surviving visual tokens are renumbered to occupy contiguous positions
+        starting at 1 (after BOS at position 0).  Cached k vectors are
+        re-rotated via RoPE to reflect new positions; v vectors are gathered.
+
+        Returns the new prefix length (BOS + surviving visual tokens).
+        """
+        c = self.config.text
+        pl = self.pruning_config.prune_layer
+
+        # New positions: BOS stays at 0; surviving visual tokens renumbered 1..K.
+        new_visual_pos = torch.arange(
+            1, keep_indices.shape[0] + 1, dtype=torch.long, device=self.device
+        )
+        old_visual_pos = keep_indices + 1  # original positions in the prefix
+
+        for i in range(pl + 1):
+            block = self.text.blocks[i]
+            kv = block.kv_cache
+            # Gather k, v for BOS + surviving visual tokens
+            sel = torch.cat(
+                [torch.tensor([0], device=self.device), old_visual_pos]
+            )  # (1 + K,)
+            k_sel = kv.k_cache[:, :, sel, :]  # (1, H, 1+K, head_dim)
+            v_sel = kv.v_cache[:, :, sel, :]
+
+            # Re-rotate k: RoPE is a rotation, so k@R(p_old) @ R(delta) = k@R(p_new)
+            k_sel_visual = k_sel[:, :, 1:, :]
+            k_sel_visual = rerotate_rope(
+                k_sel_visual,
+                self.text.freqs_cis,
+                old_visual_pos,
+                new_visual_pos,
+                c.n_kv_heads,
+            )
+            k_sel = torch.cat([k_sel[:, :, :1, :], k_sel_visual], dim=2)
+
+            # Write back to the beginning of the cache
+            new_prefix = 1 + keep_indices.shape[0]
+            kv.k_cache[:, :, :new_prefix, :] = k_sel
+            kv.v_cache[:, :, :new_prefix, :] = v_sel
+
+        return 1 + keep_indices.shape[0]
+
     def encode_image(
         self,
         image: Union[Image.Image, EncodedImage],
@@ -254,14 +331,62 @@ class MoondreamModel(nn.Module):
             inputs_embeds = torch.cat([bos_emb, img_emb[None]], dim=1)
             mask = self.attn_mask[:, :, 0 : inputs_embeds.size(1), :]
             pos_ids = torch.arange(inputs_embeds.size(1), dtype=torch.long)
-            self._prefill(inputs_embeds, mask, pos_ids, lora)
+
+            pc = self.pruning_config
+            if pc.enabled:
+                # --- TopV pruning ---
+                pl = pc.prune_layer
+                n_visual = img_emb.shape[0]
+
+                # Run layers 0..pl-1 to get source = input to layer pl.
+                source = self._prefill(
+                    inputs_embeds, mask, pos_ids, lora,
+                    start_layer=0, end_layer=pl,
+                )
+                # Run layer pl to get target = output of layer pl.
+                hidden = self._prefill(
+                    source, mask, pos_ids, lora,
+                    start_layer=pl, end_layer=pl + 1,
+                )
+                source_visual = source[:, 1 : 1 + n_visual, :]  # (1, N, D)
+                target_visual = hidden[:, 1 : 1 + n_visual, :]  # (1, N, D)
+
+                keep_indices = prune_visual_tokens(
+                    source_visual.squeeze(0),
+                    target_visual.squeeze(0),
+                    pc,
+                )  # (K,)
+
+                # Compact hidden states: BOS + surviving visual tokens.
+                keep_full = torch.cat(
+                    [torch.tensor([0], device=self.device), keep_indices + 1]
+                )
+                inputs_embeds = inputs_embeds[:, keep_full, :]
+
+                # Compact KV caches for layers 0..pl and re-rotate k.
+                new_prefix = self._compact_kv_caches(keep_indices, n_visual, lora)
+
+                # Rebuild attention mask with the compacted prefix length.
+                self._rebuild_attn_mask(new_prefix)
+
+                # Continue prefill layers pl+1..n with compacted sequence.
+                mask = self.attn_mask[:, :, 0:new_prefix, :]
+                pos_ids = torch.arange(new_prefix, dtype=torch.long)
+                self._prefill(
+                    inputs_embeds, mask, pos_ids, lora,
+                    start_layer=pl + 1, end_layer=None,
+                )
+                final_len = new_prefix
+            else:
+                self._prefill(inputs_embeds, mask, pos_ids, lora)
+                final_len = inputs_embeds.size(1)
 
         return EncodedImage(
-            pos=inputs_embeds.size(1),
+            pos=final_len,
             caches=[
                 (
-                    b.kv_cache.k_cache[:, :, : inputs_embeds.size(1), :].clone(),
-                    b.kv_cache.v_cache[:, :, : inputs_embeds.size(1), :].clone(),
+                    b.kv_cache.k_cache[:, :, :final_len, :].clone(),
+                    b.kv_cache.v_cache[:, :, :final_len, :].clone(),
                 )
                 for b in self.text.blocks
             ],
