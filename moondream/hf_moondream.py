@@ -62,6 +62,14 @@ class HfMoondream(PreTrainedModel):
         self._setup_caches()
         return self.model.query
 
+    def enable_disaggregated_streams(self):
+        self._setup_caches()
+        return self.model.enable_disaggregated_streams()
+
+    def query_disaggregated(self, *args, **kwargs):
+        self._setup_caches()
+        return self.model.query_disaggregated(*args, **kwargs)
+
     @property
     def caption(self):
         self._setup_caches()

@@ -20,6 +20,7 @@ import torch
 from transformers import AutoTokenizer
 
 from .hf_moondream import HfConfig, HfMoondream
+from .quantization import QuantizationConfig, apply_mixed_quantization
 from .topv import PruningConfig
 from .weights import load_weights_into_model
 
@@ -59,6 +60,7 @@ class Moondream(HfMoondream):
         torch_dtype: Optional[torch.dtype] = None,
         device: Optional[Union[str, torch.device]] = None,
         pruning_config: Optional[PruningConfig] = None,
+        quantization_config: Optional[QuantizationConfig] = None,
         **kwargs,
     ) -> "Moondream":
         # Build the model with the default MoondreamConfig (the hub config.json
@@ -78,6 +80,16 @@ class Moondream(HfMoondream):
         model = model.to(dtype=dtype)
         if device is not None:
             model = model.to(device)
+
+        # Mixed post-training quantization: quantize text decoder Linear
+        # weights only. Vision/projector/region/lm_head remain BF16.
+        if quantization_config is not None and quantization_config.enabled:
+            model.quantization_summary = apply_mixed_quantization(
+                model.model, quantization_config
+            )
+        else:
+            model.quantization_summary = {"mode": "none", "quantized_modules": 0}
+
         model.eval()
         return model
 

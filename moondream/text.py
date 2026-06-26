@@ -135,12 +135,7 @@ def text_decoder(
     start_layer: int = 0,
     end_layer: Optional[int] = None,
 ):
-    """Run text decoder blocks[start_layer:end_layer].
-
-    When start_layer/end_layer are given, only a contiguous range of blocks
-    is executed. This supports mid-prefill token pruning: run layers 0..Li,
-    prune/compact, then run layers Li+1..Ln on the reduced sequence.
-    """
+    """Run text decoder blocks[start_layer:end_layer] using model-owned KV caches."""
     if end_layer is None:
         end_layer = len(w.blocks)
     for i in range(start_layer, end_layer):
@@ -159,6 +154,48 @@ def text_decoder(
             block.attn,
             freqs_cis=w.freqs_cis,
             kv_cache=block.kv_cache,
+            attn_mask=attn_mask,
+            n_heads=config.n_heads,
+            n_kv_heads=config.n_kv_heads,
+            position_ids=position_ids,
+            lora=attn_lora,
+        )
+        l_mlp = mlp(l_in, block.mlp, lora=mlp_lora)
+        x = x + l_attn + l_mlp
+
+    return x
+
+
+def text_decoder_state(
+    x: torch.Tensor,
+    w: nn.Module,
+    attn_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+    config: TextConfig,
+    lora: Optional[dict],
+    kv_caches,
+    start_layer: int = 0,
+    end_layer: Optional[int] = None,
+):
+    """Run text decoder blocks[start_layer:end_layer] using request-owned KV caches."""
+    if end_layer is None:
+        end_layer = len(w.blocks)
+    for i in range(start_layer, end_layer):
+        block = w.blocks[i]
+        if lora is not None:
+            layer_lora = lora["text"]["blocks"][str(i)]
+            mlp_lora = layer_lora["mlp"]
+            attn_lora = layer_lora["attn"]
+        else:
+            mlp_lora = None
+            attn_lora = None
+
+        l_in = layer_norm(x, block.ln)
+        l_attn = attn(
+            l_in,
+            block.attn,
+            freqs_cis=w.freqs_cis,
+            kv_cache=kv_caches[i],
             attn_mask=attn_mask,
             n_heads=config.n_heads,
             n_kv_heads=config.n_kv_heads,

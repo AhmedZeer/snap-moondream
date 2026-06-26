@@ -10,7 +10,7 @@ from tokenizers import Tokenizer
 from .config import MoondreamConfig
 from .image_crops import reconstruct_from_crops
 from .vision import vision_encoder, vision_projection, prepare_crops, build_vision_model
-from .text import build_text_model, text_encoder, lm_head, text_decoder
+from .text import build_text_model, text_encoder, lm_head, text_decoder, text_decoder_state
 from .region import (
     decode_coordinate,
     encode_coordinate,
@@ -59,6 +59,12 @@ DEFAULT_MAX_OBJECTS = 50
 class EncodedImage:
     pos: int
     caches: List[Tuple[torch.Tensor, torch.Tensor]]
+
+
+@dataclass
+class RequestState:
+    pos: int
+    kv_caches: List["KVCache"]
 
 
 class KVCache(nn.Module):
@@ -182,6 +188,27 @@ class MoondreamModel(nn.Module):
                 dtype=self.vision.pos_emb.dtype,
             )
 
+    def enable_disaggregated_streams(self):
+        """Create dedicated CUDA streams for encode/prefill/decode.
+
+        This enables explicit stage separation and event-based ordering.
+        No effect on non-CUDA devices.
+        """
+        self.use_disaggregated_streams = self.device.type == "cuda"
+        if not self.use_disaggregated_streams:
+            self.encode_stream = None
+            self.prefill_stream = None
+            self.decode_stream = None
+            self.encode_done = None
+            self.prefill_done = None
+            return
+
+        self.encode_stream = torch.cuda.Stream(device=self.device)
+        self.prefill_stream = torch.cuda.Stream(device=self.device)
+        self.decode_stream = torch.cuda.Stream(device=self.device)
+        self.encode_done = torch.cuda.Event(enable_timing=False)
+        self.prefill_done = torch.cuda.Event(enable_timing=False)
+
     @property
     def device(self):
         return self.vision.pos_emb.device
@@ -202,8 +229,36 @@ class MoondreamModel(nn.Module):
         end_layer: Optional[int] = None,
     ):
         return text_decoder(
-            x, self.text, attn_mask, pos_ids, self.config.text, lora,
-            start_layer=start_layer, end_layer=end_layer,
+            x,
+            self.text,
+            attn_mask,
+            pos_ids,
+            self.config.text,
+            lora,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+
+    def _prefill_state(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor,
+        pos_ids: torch.Tensor,
+        kv_caches: List[KVCache],
+        lora: Optional[torch.Tensor],
+        start_layer: int = 0,
+        end_layer: Optional[int] = None,
+    ):
+        return text_decoder_state(
+            x,
+            self.text,
+            attn_mask,
+            pos_ids,
+            self.config.text,
+            lora,
+            kv_caches=kv_caches,
+            start_layer=start_layer,
+            end_layer=end_layer,
         )
 
     def _decode_one_tok(
@@ -214,6 +269,26 @@ class MoondreamModel(nn.Module):
         lora: Optional[torch.Tensor],
     ):
         hidden = text_decoder(x, self.text, attn_mask, pos_ids, self.config.text, lora)
+        logits = lm_head(hidden, self.text)
+        return logits, hidden
+
+    def _decode_one_tok_state(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor,
+        pos_ids: torch.Tensor,
+        kv_caches: List[KVCache],
+        lora: Optional[torch.Tensor],
+    ):
+        hidden = text_decoder_state(
+            x,
+            self.text,
+            attn_mask,
+            pos_ids,
+            self.config.text,
+            lora,
+            kv_caches=kv_caches,
+        )
         logits = lm_head(hidden, self.text)
         return logits, hidden
 
@@ -314,9 +389,10 @@ class MoondreamModel(nn.Module):
         elif not isinstance(image, Image.Image):
             raise ValueError("image must be a PIL Image or EncodedImage")
 
+        variant = settings.get("variant") if settings is not None else None
         lora = (
-            variant_state_dict(settings["variant"], device=self.device)
-            if settings is not None and settings["variant"] is not None
+            variant_state_dict(variant, device=self.device)
+            if variant is not None
             else None
         )
 
@@ -463,9 +539,10 @@ class MoondreamModel(nn.Module):
             if settings
             else DEFAULT_TEMPERATURE
         )
+        variant = settings.get("variant") if settings is not None else None
         lora = (
-            variant_state_dict(settings["variant"], device=self.device)
-            if settings is not None and "variant" in settings
+            variant_state_dict(variant, device=self.device)
+            if variant is not None
             else None
         )
 
@@ -577,9 +654,10 @@ class MoondreamModel(nn.Module):
         )
         top_p = settings.get("top_p", DEFAULT_TOP_P) if settings else DEFAULT_TOP_P
         eos_id = eos_id if eos_id is not None else self.config.tokenizer.eos_id
+        variant = settings.get("variant") if settings is not None else None
         lora = (
-            variant_state_dict(settings["variant"], device=self.device)
-            if settings is not None and "variant" in settings
+            variant_state_dict(variant, device=self.device)
+            if variant is not None
             else None
         )
 
@@ -663,6 +741,106 @@ class MoondreamModel(nn.Module):
 
         return generator(next_token, pos)
 
+    def query_disaggregated(
+        self,
+        image: Optional[Union[Image.Image, EncodedImage]] = None,
+        question: str = None,
+        spatial_refs: Optional[SpatialRefs] = None,
+        settings: Optional[TextSamplingSettings] = None,
+    ):
+        """Query path with explicit encode/prefill/decode CUDA streams.
+
+        This is the stage-separated path used for disaggregated inference.
+        It currently supports the standard non-reasoning query path.
+        """
+        if question is None:
+            raise ValueError("question must be provided.")
+        if spatial_refs and image is None:
+            raise ValueError("spatial_refs can only be used with an image.")
+
+        max_tokens = settings.get("max_tokens", DEFAULT_MAX_TOKENS) if settings else DEFAULT_MAX_TOKENS
+        if not getattr(self, "use_disaggregated_streams", False) or self.device.type != "cuda":
+            return self.query(image=image, question=question, reasoning=False, spatial_refs=spatial_refs, stream=False, settings=settings)
+
+        # Stage 1: encode on its dedicated stream.
+        if isinstance(image, EncodedImage):
+            encoded_image = image
+        else:
+            with torch.cuda.stream(self.encode_stream):
+                encoded_image = self.encode_image(image, settings)
+            self.encode_done.record(self.encode_stream)
+            self.encode_stream.synchronize()
+
+        request_state = self.make_request_state(encoded_image)
+
+        # Stage 2: prefill on its dedicated stream.
+        if not isinstance(image, EncodedImage):
+            self.prefill_stream.wait_event(self.encode_done)
+        with torch.cuda.stream(self.prefill_stream):
+            pos = request_state.pos
+            prompt_toks = self.config.tokenizer.templates["query"]["prefix"]
+
+            spatial_toks = []
+            if spatial_refs:
+                for ref in spatial_refs:
+                    coord_id = self.config.tokenizer.coord_id
+                    size_id = self.config.tokenizer.size_id
+                    if len(ref) == 2:
+                        spatial_toks.extend([coord_id, coord_id])
+                    else:
+                        spatial_toks.extend([coord_id, coord_id, size_id])
+
+            prompt_tokens = [
+                prompt_toks + spatial_toks + self.tokenizer.encode(question).ids + self.config.tokenizer.templates["query"]["suffix"]
+            ]
+            prompt_tokens = torch.tensor(prompt_tokens, device=self.device)
+            prompt_emb = text_encoder(prompt_tokens, self.text)
+
+            prompt_mask = self.attn_mask[:, :, pos : pos + prompt_emb.size(1), :]
+            prompt_pos_ids = torch.arange(
+                pos, pos + prompt_emb.size(1), device=self.device, dtype=torch.long
+            )
+            hidden_BC = self._prefill_state(
+                prompt_emb,
+                prompt_mask,
+                prompt_pos_ids,
+                request_state.kv_caches,
+                None,
+            )
+            logits_BV = lm_head(hidden_BC, self.text)
+            next_token = torch.argmax(logits_BV, dim=-1).unsqueeze(1)
+            pos = pos + prompt_emb.size(1)
+            self.prefill_done.record(self.prefill_stream)
+            self.prefill_stream.synchronize()
+
+        # Stage 3: decode on its dedicated stream.
+        self.decode_stream.wait_event(self.prefill_done)
+        answer_tokens = []
+        with torch.cuda.stream(self.decode_stream):
+            mask = torch.zeros(
+                1, 1, self.config.text.max_context, device=self.device, dtype=torch.bool
+            )
+            mask[:, :, :pos] = 1
+            pos_ids = torch.tensor([pos], device=self.device, dtype=torch.long)
+            generated_tokens = 0
+            with torch.inference_mode():
+                while (
+                    next_token_id := next_token.item()
+                ) != self.config.tokenizer.eos_id and generated_tokens < max_tokens:
+                    answer_tokens.append(next_token_id)
+                    next_emb = text_encoder(next_token, self.text)
+                    mask[:, :, pos], pos_ids[0] = 1, pos
+                    logits_BV, _ = self._decode_one_tok_state(
+                        next_emb, mask, pos_ids, request_state.kv_caches, None
+                    )
+                    logits_BV[:, self.config.tokenizer.answer_id] = float("-inf")
+                    pos += 1
+                    next_token = torch.argmax(logits_BV, dim=-1).unsqueeze(1)
+                    generated_tokens += 1
+
+        self.decode_stream.synchronize()
+        return {"answer": self.tokenizer.decode(answer_tokens)}
+
     def query(
         self,
         image: Optional[Union[Image.Image, EncodedImage]] = None,
@@ -741,6 +919,24 @@ class MoondreamModel(nn.Module):
             return {**reasoning_dict, "answer": generator()}
         else:
             return {**reasoning_dict, "answer": "".join(list(generator()))}
+
+    def make_request_state(self, encoded_image: EncodedImage) -> RequestState:
+        """Create request-owned KV caches from an encoded image snapshot."""
+        c = self.config.text
+        kv_caches = []
+        for k, v in encoded_image.caches:
+            cache = KVCache(
+                c.n_heads,
+                c.n_kv_heads,
+                c.max_context,
+                c.dim,
+                device=self.device,
+                dtype=self.vision.pos_emb.dtype,
+            )
+            cache.k_cache[:, :, : k.size(2), :] = k
+            cache.v_cache[:, :, : v.size(2), :] = v
+            kv_caches.append(cache)
+        return RequestState(pos=encoded_image.pos, kv_caches=kv_caches)
 
     def load_encoded_image(self, encoded_image: EncodedImage):
         for b, (k, v) in zip(self.text.blocks, encoded_image.caches):
@@ -878,9 +1074,10 @@ class MoondreamModel(nn.Module):
             device=self.device,
         )
 
+        variant = settings.get("variant") if settings is not None else None
         lora = (
-            variant_state_dict(settings["variant"], device=self.device)
-            if settings is not None and "variant" in settings
+            variant_state_dict(variant, device=self.device)
+            if variant is not None
             else None
         )
 
@@ -926,9 +1123,10 @@ class MoondreamModel(nn.Module):
             device=self.device,
         )
 
+        variant = settings.get("variant") if settings is not None else None
         lora = (
-            variant_state_dict(settings["variant"], device=self.device)
-            if settings is not None and "variant" in settings
+            variant_state_dict(variant, device=self.device)
+            if variant is not None
             else None
         )
 

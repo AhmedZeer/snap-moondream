@@ -9,6 +9,14 @@ that mirrors the original ``moondream`` PyPI shim.
 """
 
 from .hf import LATEST_REVISION, Moondream, detect_device
+from .quantization import QuantizationConfig
+from .topv import PruningConfig
 
-__all__ = ["LATEST_REVISION", "Moondream", "detect_device"]
+__all__ = [
+    "LATEST_REVISION",
+    "Moondream",
+    "detect_device",
+    "PruningConfig",
+    "QuantizationConfig",
+]
 __version__ = "0.1.0"
